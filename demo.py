@@ -172,7 +172,18 @@ if __name__ == '__main__':
     reader = Process(target=mono_stream, args=(queue, args.imagedir, args.calib, args.undistort, args.cropborder, args.start, args.length))
     reader.start()
 
-    args.buffer = min(1000, N // 10 + 150) if args.buffer < 0 else args.buffer
+    if args.buffer < 0:
+        if args.holdout_every > 0 or args.dual_stage_eval:
+            # Benchmark runs can retain substantially more mapping keyframes than
+            # the original heuristic predicts, and terminate() can temporarily
+            # insert supplemental non-keyframes. Reserve one slot per selected
+            # input frame plus a small guard margin. This changes capacity only;
+            # it does not change keyframe selection or any optimization logic.
+            args.buffer = run_N + 32
+        else:
+            args.buffer = min(1000, N // 10 + 150)
+    print(f"DepthVideo buffer: {args.buffer}")
+
     pbar = tqdm(total=run_N, desc="Processing keyframes")
     online_start = None
 
