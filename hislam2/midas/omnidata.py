@@ -73,7 +73,11 @@ class OmnidataModel:
 
         self.model = DPTDepthModel(backbone=self.backbone, num_channels=self.channel)
 
-        checkpoint = torch.load(self.model_path, map_location=device)
+        # Omnidata checkpoints are trusted PyTorch Lightning checkpoints, not
+        # weights-only archives. PyTorch 2.6+ defaults torch.load() to
+        # weights_only=True, so request the legacy/full checkpoint loader
+        # explicitly for compatibility with the original HI-SLAM2 assets.
+        checkpoint = torch.load(self.model_path, map_location=device, weights_only=False)
         assert "state_dict" in checkpoint, "No state_dict found in checkpoint"
 
         state_dict = {}
