@@ -7,11 +7,22 @@ import cv2
 import re
 import os
 import argparse
+import warnings
 import numpy as np
 import lietorch
 import resource
 rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (100000, rlimit[1]))
+
+# HI-SLAM2 was written against the torch.cuda.amp.autocast API used by
+# PyTorch 2.1. Newer PyTorch versions keep the same behavior but emit a
+# FutureWarning recommending torch.amp.autocast('cuda', ...). Suppress only
+# that compatibility warning so the original AMP execution path is unchanged.
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r"`torch\.cuda\.amp\.autocast\(args\.\.\.\)` is deprecated.*",
+)
 
 from tqdm import tqdm
 from torch.multiprocessing import Process, Queue
