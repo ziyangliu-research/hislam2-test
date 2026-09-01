@@ -24,6 +24,10 @@ class Hi2:
         self.config = config = load_config(args.config)
         self.args = args
         self.images = {}
+        # Evaluation-only bookkeeping. Empty by default, so the original
+        # HI-SLAM2 pipeline is unchanged unless a benchmark explicitly marks
+        # frames as pose-only/held-out.
+        self.mapping_excluded_tstamps = set()
 
         # store images, depth, poses, intrinsics (shared between processes)
         self.video = DepthVideo(config, args.image_size, args.buffer)
@@ -82,17 +86,21 @@ class Hi2:
                 'scale_updates': dscale.to(device='cpu') if dscale is not None else None}
         self.gs.process_track_data(data)
 
-    def track(self, tstamp, image, intrinsics=None, is_last=False):
+    def track(self, tstamp, image, intrinsics=None, is_last=False, allow_mapping=True):
         """ main thread - update map """
 
         with torch.no_grad():
             self.images[tstamp] = image
+            if not allow_mapping:
+                self.mapping_excluded_tstamps.add(int(tstamp))
 
-            # check there is enough motion
-            self.filterx.track(tstamp, image, intrinsics, is_last)
+            # check there is enough motion. Held-out frames still participate in
+            # motion/pose estimation but are not allowed into the map.
+            self.filterx.track(tstamp, image, intrinsics, is_last, allow_mapping=allow_mapping)
 
-            # local bundle adjustment
-            viz_idx = self.frontend(is_last=is_last)
+            # local bundle adjustment. If the frame was pose-only the video
+            # counter did not grow, so this is a no-op.
+            viz_idx = self.frontend(is_last=is_last and allow_mapping)
 
         if len(viz_idx) and self.pgba:
             dposes, dscale = self.video.pgobuf.run_pgba(self.LC_data_queue)
@@ -102,7 +110,7 @@ class Hi2:
         if len(viz_idx):
             self.call_gs(viz_idx)
 
-    def terminate(self):
+    def terminate(self, run_builtin_eval=True):
         """ terminate the visualization process, return poses [t, q] """
         self.video.ready.value = 1
         if self.pgba:
@@ -127,7 +135,12 @@ class Hi2:
                 if ind2 not in self.video.tstamp:
                     new_kfs.append(ind2)
                 print(f' - add new keyframe {ind1} and {ind2} for {self.video.tstamp[i].item()}')
-        new_kfs = sorted(list(set(new_kfs)))
+        # Evaluation protocol: held-out frames must remain pose-only even in the
+        # official post-processing step that supplements keyframes.
+        new_kfs = sorted(
+            ind for ind in set(new_kfs)
+            if int(ind) not in self.mapping_excluded_tstamps
+        )
 
         # fill in poses for new keyframes
         for i in range(0, len(new_kfs), 10):
@@ -160,5 +173,6 @@ class Hi2:
         self.video.poses[:self.video.counter.value] = torch.tensor(updated_poses[:,1:])
 
         traj_full = self.traj_filler(self.images)
-        self.gs.eval_rendering(self.images, self.args.gtdepthdir, traj_full.matrix().data, self.video.tstamp[:self.video.counter.value].to(device='cpu'))
+        if run_builtin_eval:
+            self.gs.eval_rendering(self.images, self.args.gtdepthdir, traj_full.matrix().data, self.video.tstamp[:self.video.counter.value].to(device='cpu'))
         return traj_full.inv().data.cpu().numpy()
