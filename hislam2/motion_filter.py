@@ -74,8 +74,15 @@ class MotionFilter:
 
     @torch.cuda.amp.autocast(enabled=True)
     @torch.no_grad()
-    def track(self, tstamp, image, intrinsics=None, is_last=False):
-        """ main update operation - run on every frame in video """
+    def track(self, tstamp, image, intrinsics=None, is_last=False, allow_mapping=True):
+        """Main update operation.
+
+        ``allow_mapping=False`` is an evaluation-protocol hook. The frame still
+        goes through feature extraction and motion estimation, but it is never
+        inserted into the keyframe/depth-video map and is never cached as a
+        future mapping candidate. The default keeps the original HI-SLAM2
+        behavior unchanged.
+        """
 
         Id = lietorch.SE3.Identity(1,).data.squeeze()
         ht = image.shape[-2] // 8
@@ -93,6 +100,8 @@ class MotionFilter:
 
         ### always add first frame to the depth video ###
         if self.video.counter.value == 0:
+            if not allow_mapping:
+                raise RuntimeError("The first frame cannot be held out from mapping; choose a split whose first frame is training data.")
             depth, normal = self.prior_extractor(inputs[0])
             net, inp = self.context_encoder(inputs[:,[0]])
             self.net, self.inp, self.fmap = net, inp, gmap
@@ -108,7 +117,13 @@ class MotionFilter:
             _, delta, weight = self.update(self.net[None], self.inp[None], corr)
 
             self.deltas.append(delta.norm(dim=-1).mean().item())
-            # check motion magnitue / add new frame to video
+
+            # Hold-out/test frame: estimate motion only. Do not let this frame
+            # become a keyframe now or indirectly through the blur cache.
+            if not allow_mapping:
+                return
+
+            # check motion magnitude / add new frame to video
             thresh = self.init_thresh if not self.video.is_initialized else self.thresh
             if delta.norm(dim=-1).mean().item() > thresh or is_last:
                 index_min = np.argmax(self.shapeness)
