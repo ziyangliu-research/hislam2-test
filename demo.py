@@ -220,15 +220,15 @@ if __name__ == '__main__':
             pbar.close()
             break
 
+    # ONLINE TIMER STOPS HERE, before pose filling for metrics/rendering.
     torch.cuda.synchronize()
     online_seconds = time.perf_counter() - online_start
+    online_fps = run_N / online_seconds
     reader.join()
 
     if args.dual_stage_eval:
         # ONLINE/PRE-GLOBAL SNAPSHOT -----------------------------------------
-        # PoseTrajectoryFiller is the official HI-SLAM2 pose-only filler. It
-        # temporarily estimates poses for non-keyframes/held-out frames but
-        # does not optimize or change the Gaussian map.
+        # Everything below this point is outside the online timer.
         traj_online_internal = hi2.traj_filler(hi2.images)
         traj_online = traj_online_internal.inv().data.cpu().numpy()
         save_full_trajectory(traj_online, args.imagedir, args.output, "traj_online.txt", start=args.start)
@@ -257,15 +257,18 @@ if __name__ == '__main__':
         )
 
         # OFFICIAL FINAL PIPELINE -------------------------------------------
-        # terminate() still performs the original supplemental-keyframe step,
-        # global BA, Gaussian pose update, and global color refinement. Its
-        # built-in mixed rendering eval is skipped only because the explicit
-        # train/test evaluator below replaces that redundant evaluation.
+        # Metric rendering above is explicitly outside both algorithm timers.
+        # Offline time is only the original post-sequence HI-SLAM2 pipeline:
+        # supplemental keyframes + global BA + GS pose update + color refinement
+        # + final pose filling. The explicit final metric rendering below is not
+        # included in offline_seconds.
         torch.cuda.synchronize()
-        final_start = time.perf_counter()
+        offline_start = time.perf_counter()
         traj = hi2.terminate(run_builtin_eval=False)
         torch.cuda.synchronize()
-        final_extra_seconds = time.perf_counter() - final_start
+        offline_seconds = time.perf_counter() - offline_start
+        total_seconds = online_seconds + offline_seconds
+        effective_fps_aux = run_N / total_seconds
         save_trajectory(hi2, traj, args.imagedir, args.output, start=args.start)
 
         traj_final_c2w = torch.as_tensor(traj, dtype=torch.float32, device="cuda")
@@ -296,33 +299,59 @@ if __name__ == '__main__':
             "num_frames": run_N,
             "train_count": len(train_indices),
             "test_count": len(test_indices),
+            "timing_definition": {
+                "online_seconds": "streaming HI-SLAM2 processing only; metric rendering excluded",
+                "offline_seconds": "original terminate() post-sequence pipeline; metric rendering excluded",
+                "total_seconds": "online_seconds + offline_seconds",
+                "fps": "num_frames / online_seconds; reported for online stage only",
+            },
             "online": {
                 "train": online_train,
                 "test": online_test,
                 "gaussians": online_gaussians,
+                "online_seconds": online_seconds,
+                "offline_seconds": 0.0,
+                "total_seconds": online_seconds,
                 "algorithm_seconds": online_seconds,
-                "fps": run_N / online_seconds,
+                "fps": online_fps,
             },
             "final": {
                 "train": final_train,
                 "test": final_test,
                 "gaussians": final_gaussians,
-                "final_extra_seconds": final_extra_seconds,
-                "algorithm_seconds": online_seconds + final_extra_seconds,
-                "fps": run_N / (online_seconds + final_extra_seconds),
+                "online_seconds": online_seconds,
+                "offline_seconds": offline_seconds,
+                "total_seconds": total_seconds,
+                # Retained aliases for compatibility with earlier benchmark JSONs.
+                "final_extra_seconds": offline_seconds,
+                "algorithm_seconds": total_seconds,
+                # Main-table FPS is intentionally not defined for the offline
+                # refinement stage. Keep cumulative effective FPS only as aux.
+                "fps": None,
+                "effective_fps_aux": effective_fps_aux,
             },
         }
         with open(os.path.join(args.output, "benchmark_metrics.json"), "w", encoding="utf-8") as f:
             json.dump(benchmark, f, indent=2)
 
-        print("=" * 80)
+        print("=" * 100)
         print("Dual-stage benchmark complete")
-        print(f"Online: train {online_train['mean_psnr']:.4f}/{online_train['mean_ssim']:.6f}, "
-              f"test {online_test['mean_psnr']:.4f}/{online_test['mean_ssim']:.6f}, "
-              f"FPS {benchmark['online']['fps']:.4f}, Gaussians {online_gaussians}")
-        print(f"Final : train {final_train['mean_psnr']:.4f}/{final_train['mean_ssim']:.6f}, "
-              f"test {final_test['mean_psnr']:.4f}/{final_test['mean_ssim']:.6f}, "
-              f"effective FPS {benchmark['final']['fps']:.4f}, Gaussians {final_gaussians}")
+        print(
+            f"Online: train P/S/L {online_train['mean_psnr']:.4f}/"
+            f"{online_train['mean_ssim']:.6f}/{online_train['mean_lpips']:.6f}, "
+            f"test P/S/L {online_test['mean_psnr']:.4f}/"
+            f"{online_test['mean_ssim']:.6f}/{online_test['mean_lpips']:.6f}, "
+            f"FPS {online_fps:.4f}, time {online_seconds:.2f}s, "
+            f"Gaussians {online_gaussians}"
+        )
+        print(
+            f"Final : train P/S/L {final_train['mean_psnr']:.4f}/"
+            f"{final_train['mean_ssim']:.6f}/{final_train['mean_lpips']:.6f}, "
+            f"test P/S/L {final_test['mean_psnr']:.4f}/"
+            f"{final_test['mean_ssim']:.6f}/{final_test['mean_lpips']:.6f}, "
+            f"offline {offline_seconds:.2f}s, total {total_seconds:.2f}s, "
+            f"Gaussians {final_gaussians}"
+        )
     else:
         traj = hi2.terminate()
         save_trajectory(hi2, traj, args.imagedir, args.output, start=args.start)
