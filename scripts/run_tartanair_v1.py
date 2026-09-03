@@ -23,6 +23,10 @@ DEFAULT_DATASET_ROOT = Path("/home/shiyo/Desktop/Datasets/TartanAir_Stereo_Chall
 DEFAULT_GT_ROOT = Path("/home/shiyo/Desktop/Datasets/TartanAir_Stereo_Challenge/ground_truth/stereo_gt")
 SEQUENCES = [f"SE{i:03d}" for i in range(8)] + [f"SH{i:03d}" for i in range(8)]
 COMPARISON4 = ["SH000", "SH001", "SH002", "SH003"]
+COMPARISON8 = [
+    "SE000", "SE001", "SE002", "SE003",
+    "SH000", "SH001", "SH002", "SH003",
+]
 
 
 def parse_args():
@@ -45,7 +49,12 @@ def parse_args():
     group.add_argument(
         "--comparison4",
         action="store_true",
-        help="run the standard four-sequence comparison suite SH000-SH003",
+        help="run SH000-SH003",
+    )
+    group.add_argument(
+        "--comparison8",
+        action="store_true",
+        help="run SE000-SE003 and SH000-SH003",
     )
     parser.add_argument(
         "--benchmark",
@@ -169,13 +178,18 @@ def merged_stage_row(sequence, stage_name, render_stage, traj_eval):
         "MaxMap": traj_eval["maxmap_percent"],
         "Train_PSNR": render_stage["train"]["mean_psnr"],
         "Train_SSIM": render_stage["train"]["mean_ssim"],
+        "Train_LPIPS": render_stage["train"]["mean_lpips"],
         "Test_PSNR": render_stage["test"]["mean_psnr"],
         "Test_SSIM": render_stage["test"]["mean_ssim"],
+        "Test_LPIPS": render_stage["test"]["mean_lpips"],
         "ATE_m": traj_eval["ate_se3_m"],
         "ATE_Sim3_m_aux": traj_eval["ate_sim3_m_aux"],
-        "FPS": render_stage["fps"],
+        "FPS": render_stage.get("fps"),
+        "EffectiveFPS_aux": render_stage.get("effective_fps_aux"),
         "Gaussians": render_stage["gaussians"],
-        "AlgorithmSeconds": render_stage["algorithm_seconds"],
+        "OnlineTime_s": render_stage["online_seconds"],
+        "OfflineTime_s": render_stage["offline_seconds"],
+        "TotalTime_s": render_stage["total_seconds"],
     }
 
 
@@ -229,7 +243,7 @@ def run_sequence(args, sequence):
             "--dual-stage-eval",
         ])
 
-    print("=" * 80)
+    print("=" * 100)
     print(f"Sequence : {sequence}")
     print(f"Camera   : {args.camera} (monocular input)")
     print(f"Images   : {image_dir}")
@@ -238,6 +252,8 @@ def run_sequence(args, sequence):
     if args.benchmark:
         print(f"Split    : holdout_{args.holdout_every}_{args.holdout_offset} (test frames are pose-only)")
         print("Stages   : online/pre-global + official final/global")
+        print("Metrics  : PSNR / SSIM / LPIPS")
+        print("Timing   : online / offline / total; metric rendering excluded")
     print(f"Output   : {output_dir}")
     print("Command  :", " ".join(cmd))
 
@@ -268,6 +284,7 @@ def run_sequence(args, sequence):
             "train_count": benchmark["train_count"],
             "test_count": benchmark["test_count"],
         },
+        "timing_definition": benchmark.get("timing_definition", {}),
         "online": {**benchmark["online"], "trajectory": online_traj},
         "final": {**benchmark["final"], "trajectory": final_traj},
     }
@@ -279,23 +296,30 @@ def run_sequence(args, sequence):
     )
 
 
+def fps_text(value):
+    return "-" if value is None else f"{value:.4f}"
+
+
 def print_table(title, rows):
     if not rows:
         return
     print("\n" + title)
-    print("=" * 124)
+    print("=" * 188)
     header = (
-        f"{'Sequence':<10} {'MaxMap':>8}  {'Train PSNR/SSIM':>20}  "
-        f"{'Test PSNR/SSIM':>20}  {'ATE(m)':>10}  {'FPS':>10}  {'Gaussians':>12}"
+        f"{'Sequence':<9} {'MaxMap':>8}  {'Train P/S/L':>28}  "
+        f"{'Test P/S/L':>28}  {'ATE(m)':>10}  {'FPS':>9}  {'Gaussians':>11}  "
+        f"{'Online(s)':>10}  {'Offline(s)':>11}  {'Total(s)':>10}"
     )
     print(header)
-    print("-" * 124)
+    print("-" * 188)
     for r in rows:
-        train = f"{r['Train_PSNR']:.4f}/{r['Train_SSIM']:.6f}"
-        test = f"{r['Test_PSNR']:.4f}/{r['Test_SSIM']:.6f}"
+        train = f"{r['Train_PSNR']:.4f}/{r['Train_SSIM']:.6f}/{r['Train_LPIPS']:.6f}"
+        test = f"{r['Test_PSNR']:.4f}/{r['Test_SSIM']:.6f}/{r['Test_LPIPS']:.6f}"
         print(
-            f"{r['Sequence']:<10} {r['MaxMap']:>7.2f}%  {train:>20}  "
-            f"{test:>20}  {r['ATE_m']:>10.6f}  {r['FPS']:>10.4f}  {int(r['Gaussians']):>12d}"
+            f"{r['Sequence']:<9} {r['MaxMap']:>7.2f}%  {train:>28}  "
+            f"{test:>28}  {r['ATE_m']:>10.6f}  {fps_text(r['FPS']):>9}  "
+            f"{int(r['Gaussians']):>11d}  {r['OnlineTime_s']:>10.2f}  "
+            f"{r['OfflineTime_s']:>11.2f}  {r['TotalTime_s']:>10.2f}"
         )
 
 
@@ -303,9 +327,12 @@ def save_csv(path, rows):
     if not rows:
         return
     fields = [
-        "Sequence", "MaxMap", "Train_PSNR", "Train_SSIM", "Test_PSNR",
-        "Test_SSIM", "ATE_m", "FPS", "Gaussians", "ATE_Sim3_m_aux",
-        "AlgorithmSeconds", "Stage",
+        "Sequence", "MaxMap",
+        "Train_PSNR", "Train_SSIM", "Train_LPIPS",
+        "Test_PSNR", "Test_SSIM", "Test_LPIPS",
+        "ATE_m", "FPS", "Gaussians",
+        "OnlineTime_s", "OfflineTime_s", "TotalTime_s",
+        "ATE_Sim3_m_aux", "EffectiveFPS_aux", "Stage",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -319,6 +346,8 @@ def main():
     args = parse_args()
     if args.all:
         sequences = SEQUENCES
+    elif args.comparison8:
+        sequences = COMPARISON8
     elif args.comparison4:
         sequences = COMPARISON4
     else:
@@ -347,8 +376,10 @@ def main():
         print_table("FINAL SUMMARY — ONLINE / PRE-GLOBAL", online_rows)
         print_table("FINAL SUMMARY — OFFICIAL FINAL / GLOBAL REFINEMENT", final_rows)
         print(f"\nSaved summaries under: {args.output_root}")
-        print("ATE(m) in the main tables uses SE(3) rigid alignment (no scale correction).")
-        print("Auxiliary Sim(3)-aligned ATE is preserved in benchmark_summary.json/CSV only.")
+        print("Main ATE(m): SE(3) rigid alignment, no scale correction.")
+        print("Main FPS: online stage only; final/offline stage is shown as '-'.")
+        print("Online/Offline/Total times exclude PSNR/SSIM/LPIPS rendering/evaluation.")
+        print("Auxiliary Sim(3) ATE and cumulative effective FPS are kept in JSON/CSV only.")
 
 
 if __name__ == "__main__":
